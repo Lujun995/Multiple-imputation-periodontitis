@@ -1,0 +1,1326 @@
+---
+title: "Estimating Periodontitis Susceptibility Cases for Epidemiological Studies with Multiple Imputation"
+author: "Lujun Zhang, Mengli Xiao, Haitao Chu, Georgios A. Kotsakis, Weihua Guan"
+date: '2023-10-19'
+output: 
+  html_document:
+    number_sections: true
+---
+
+This file contains code for reproducing results and figures for the paper: Estimating Periodontitis Susceptibility Cases for Epidemiological Studies with Multiple Imputation.
+
+# Set-ups
+
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+set.seed(12345678)
+FIG.WIDTH = 8
+RECYCLE = FALSE
+library(Hmisc)
+library(tidyverse)
+# library(glmnet)
+# library(e1071)
+library(kableExtra)
+# library(ROCR)
+library(ggconsort)
+library(ggpattern)
+sum.na <- function(x) sum(x,na.rm=T)
+NA_num <- function(x) sum(is.na(x))
+carry_over_missing_sites <- function(x){
+  if(sum(!is.na(x)) == 0) return(x) else{
+    length.na <- length(x[is.na(x)])
+    x[is.na(x)] <- sample(x[!is.na(x)], replace = TRUE, size = length.na)
+    return(x)
+  }
+}
+case_definition <- function(d){
+  sum.na <- function(x){sum(x,na.rm=T)}
+
+  #only the pc and la columns
+  num.teeth <- names(d) %>% str_subset("^ohx\\d\\d") %>% 
+    str_extract("\\d\\d") %>% unique() %>% length
+  pc <- d %>% select(contains("pc"))
+  if(ncol(pc) != num.teeth*4) 
+    stop("Number of pc measurement != 4*number of teeth")
+  la <- d %>% select(contains("la"))
+  if(ncol(la) != num.teeth*4) 
+    stop("Number of la measurement != 4*number of teeth")
+
+  # No
+  ps <- rep("no", length = nrow(d)) 
+  
+  # Mild
+  al.g3 <- la >= 3
+  out <- 0
+  for (i in 1:num.teeth){
+    temp <- apply(al.g3[,(4*i-3):(4*i)], 1, sum.na) > 0
+    out <- temp + out
+  }
+  mild.al <- out >= 2
+  
+  pc.g4 <- pc >= 4
+  out <- 0
+  for (i in 1:num.teeth){
+    temp <- apply(pc.g4[,(4*i-3):(4*i)], 1, sum.na) > 0
+    out <- temp + out
+  }
+  mild.pc4 <- out >= 2
+  
+  pc.g5 <- pc >= 5
+  mild.pc5 <- apply(pc.g5, 1, sum.na) > 0
+  
+  # d$ps[((mild.pc4 * mild.al)+mild.pc5)>0] <- "mild"
+  ps[(((mild.pc4 +mild.pc5)>0)*mild.al)>0] <- "mild"
+  
+  # Moderate
+  al.g4 <- la >= 4
+  out <- 0
+  for (i in 1:num.teeth){
+    temp <- apply(al.g4[,(4*i-3):(4*i)], 1, sum.na) > 0
+    out <- temp + out
+  }
+  moderate.al <- out >= 2
+  
+  pc.g5 <- pc >= 5
+  out <- 0
+  for (i in 1:num.teeth){
+    temp <- apply(pc.g5[,(4*i-3):(4*i)], 1, sum.na) > 0
+    out <- temp + out
+  }
+  moderate.pc <- out >= 2
+  
+  ps[(moderate.pc+moderate.al) > 0] <- "mod"
+  
+  # Severer
+  al.g6 <- la >= 6
+  out <- 0
+  for (i in 1:num.teeth){
+    temp <- apply(al.g6[,(4*i-3):(4*i)], 1, sum.na) > 0
+    out <- temp + out
+  }
+  severer.al <- out >= 2
+  
+  pc.g5 <- pc >= 5
+  severer.pc5 <- apply(pc.g5, 1, sum.na) > 0
+  
+  ps[(severer.al*severer.pc5)>0] <- "sev"
+  S <- ps=="sev"
+  MS <- ps=="sev" | ps=="mod"
+  d <- d %>% mutate(ps = ps, S = S, MS = MS)
+  return(d)
+}
+
+calculate_metrics <- function(data = c("Original","With MICE"), 
+                  method = c("Full Mouth", "naive Ramfjord", "SVM (Full Mouth)", "SVM (Ramfjord Teeth)"), 
+                  case = c("Severe", "Moderate-Severe"),
+                  test.d_miced = test.d_miced, test.d_orgin = test.d_orgin, 
+                  train.d_miced = train.d_miced, train.d_orgin = train.d_orgin,
+                  Ramfjord = Ramfjord, Full_mouth = Full_mouth,
+                  digit = 1){
+  if(data == "Original") {
+    train <- train.d_orgin
+    test <- test.d_orgin
+  }else if(data == "With MICE"){
+    train <- train.d_miced
+    test <- test.d_miced
+  }
+  
+  
+  if(case == "Severe") {
+    VAR = "S"
+  }else if(case == "Moderate-Severe"){
+    VAR = "MS"
+  }
+  true_value = pull(test, VAR) %>% as.numeric() #1/0
+  
+  flag_fixed <- NA
+  if(method == "Full Mouth") {
+    pred_value <- true_value %>% as.numeric()
+    flag_fixed <- TRUE
+  } else if(method == "naive Ramfjord"){
+    pred_value <- test %>% select(all_of(Ramfjord)) %>% case_definition() %>% 
+      pull(VAR) %>% as.numeric()
+    flag_fixed <- TRUE
+  } else if(method == "SVM (Ramfjord Teeth)"){
+    # how to deal with the missing values when it comes to SVM???
+    index <- which(names(train) %in% Full_mouth)
+    for(i in index) {train[[i]] <- replace_na(train[[i]], 0); test[[i]] <- replace_na(test[[i]], 0)}
+    model <- train %>% mutate(S = as.numeric(S), MS = as.numeric(MS)) %>%
+      svm(formula = as.formula(
+        paste(VAR, "~", paste(Ramfjord,collapse="+"), collapse= "")),data= .)
+    pred_value <- predict(model, type="response", newdata=test)
+    flag_fixed <- FALSE
+  } else if(method == "SVM (Full Mouth)"){
+    index <- which(names(train) %in% Full_mouth)
+    for(i in index) {train[[i]] <- replace_na(train[[i]], 0); test[[i]] <- replace_na(test[[i]], 0)}
+    model <- train %>% mutate(S = as.numeric(S), MS = as.numeric(MS)) %>% 
+      svm(formula = as.formula(
+            paste(VAR, "~", paste(Full_mouth,collapse="+"), collapse= "")),data= .)
+    pred_value <- predict(model, type="response", newdata=test)
+    flag_fixed <- FALSE
+  }
+  
+  # metric = c("Prevalence", "AUC", "Sensitivity", "Specificity", "F1-score", 
+  #                            "Diagnostic Odds Ratio")
+  
+  if(flag_fixed){
+    temp <- table(predictions = pred_value, true = true_value)
+    TN = temp[1,1]
+    FP = temp[2,1]
+    TP = temp[2,2]
+    FN = temp[1,2]
+  } else if(!flag_fixed){
+    for(threshold in 0:100){
+      pred_value_temp <- as.numeric(pred_value >= threshold/100)
+      temp <- table(predictions = pred_value_temp, true = true_value)
+      TN = temp[1,1]
+      FP = temp[2,1]
+      TP = temp[2,2]
+      FN = temp[1,2]
+      Specificity = TN/(TN+FP)
+      if(Specificity >= 0.95) break
+    }
+  }
+  
+  metrics = c("Prevalence", "AUC", "Sensitivity", "Specificity", "F1-score", "Diagnostic Odds Ratio")
+  metric = rep(NA, length=length(metrics))
+  names(metric) <- metrics
+  metric["Prevalence"] <- (TP+FP)/(TP+TN+FP+FN)
+  metric["Sensitivity"] <- TP/(TP+FN)
+  metric["Specificity"] <- TN/(TN+FP)
+  metric["F1-score"] <- 2*TP/(2*TP+FP+FN)
+  metric["Diagnostic Odds Ratio"] <- (TP/FN)/(FP/TN)
+  if(flag_fixed) metric["AUC"] <- NA else if(!flag_fixed){
+    perf <- prediction(predictions = pred_value, labels = true_value) %>% performance(., "auc")
+    metric["AUC"] <- perf@y.values[[1]]
+  }
+  return(metric)
+}
+
+#color map:
+COLORS = c(hsv(h=336/360, s = 1, v = 0.85), hsv(h=189/360, s = 1, v = 0.85),
+           hsv(h=336/360, s = 1, v = 0.5), hsv(h=189/360, s = 1, v = 0.5),
+           hsv(h=336/360, s = 1, v = 0.2), hsv(h=189/360, s = 1, v = 0.2))
+```
+
+# Data input part:
+
+This part generates a test set and a train set. 
+
+Definition of covariates：
+
+-   ohq835: integer, Do you think you might have gum disease?
+-   ohq850: integer, Ever had treatment for gum disease?
+-   ohq855: integer, Any teeth became loose without an injury
+-   ohq860: integer, Ever been told of bone loss around teeth
+-   smk_stt: bollean, derived from `smq020` and `smq 040`
+    -   If `SMQ020` AND `SMQ040` are both positive then YES, if else NO.
+    -   `smq020`: {1,2,NA} "Smoked at least 100 cigarettes in life"
+    -   `smq040`: {1,2,3,NA} "Do you now smoke cigarettes"
+
+Datasets:
+
+-   `DATA`: dental health examination data
+-   `demo`: demographic data
+-   `Q4` and `Q5`: four question variables and `smk_stt`
+-   `data`: metged dataset
+
+Case definition in the original dataset:
+
+-   Create the periodontal disease classification variable `sp`
+-   Separate variables into probing and attachment measures
+-   Input:
+    -   the dataset includes No. 02-31 teeth and each tooth has `la` and `pc` measurements.
+    -   NAs were consider **negative**
+-   Outcomes:
+    -   `d$ps`: indicator for periodontal disease, values "mild", "mod", "sev"
+    -   `d$S`: indicator for *severe* periodontal disease, values TRUE/FALSE
+    -   `d$MS`: indicator for *moderate* to *severe* periodontal diseases, values TRUE/FALSE
+
+```{r input and pre-process}
+DATA <- read.csv("perio_NHANES.csv")
+demo <- read.csv("nhanes_demo.csv")
+temp1 <- merge(DATA, demo, all=F, by.x="seqn", by.y= "SEQN")
+
+covariates <- c("seqn", "ohq835", "ohq850", "ohq855", "ohq860")
+
+#Check if the data given by George is the one where no-tooth participants are filtered.
+DATA.F <- haven::read_xpt("OHXPER_F.xpt")
+DATA.G <- haven::read_xpt("OHXPER_G.xpt")
+if(identical(names(DATA.F), names(DATA.G)))
+  DATA.raw <- bind_rows(DATA.F, DATA.G) else
+    stop("variable names of DATA.F and DATA.G do not match")
+names(DATA.raw) <- tolower(names(DATA.raw))
+DATA.processed <- DATA.raw %>% 
+  select("seqn", matches("[(pc)(la)][dspa]$"))
+for(i in 2:length(DATA.processed))
+  DATA.processed[[i]] <- na_if(DATA.processed[[i]], 99)
+teeth.processed <- DATA.processed %>% 
+  select( starts_with("ohx") | starts_with("seqn")) %>%
+  pivot_longer(cols = starts_with("ohx"),
+               names_to = "tooth_id",
+               values_to = "value") %>%
+  mutate(tooth = str_extract(tooth_id, "\\d\\d"),
+         test = str_extract(tooth_id, "pc|la"),
+         site = str_extract(tooth_id, "[d|s|p|a]$"))
+num_missing_tooth.processed <- teeth.processed %>% 
+  group_by(seqn, tooth, test) %>% 
+  summarise(NA_num = NA_num(value)) %>%
+  ungroup() %>%
+  filter(NA_num == 4) %>% 
+  group_by(seqn, test) %>%
+  summarise(num_missing_tooth = n()) %>%
+  ungroup() %>% 
+  filter(test == "la") %>% select(-test)#num_missing_tooth.la == num_missing_tooth.pc
+DATA.processed <- DATA.processed %>% 
+  left_join(x = ., y = num_missing_tooth.processed, by = "seqn") %>%
+  replace_na(list(num_missing_tooth = 0))
+temp <- DATA.processed %>% filter(!(seqn %in% DATA$seqn)) %>% pull(num_missing_tooth) %>% unique()
+if(temp != 28) stop("The excluded participants are not only those having not teeth!")
+temp <- DATA.processed %>% filter(num_missing_tooth == 28) %>% nrow()
+if(temp != nrow(DATA.processed) - nrow(DATA)) 
+  stop("the number of no-tooth participants does not equal to the difference between the two DATA")
+
+try.F <- sasxport.get("OHQ_F.xpt")
+Q4.F <- try.F[,c("seqn", "ohq835", "ohq850", "ohq855", "ohq860")]
+try.G <- sasxport.get("OHQ_G.xpt")
+Q4.G <- try.G[,c("seqn", "ohq835", "ohq850", "ohq855", "ohq860")]
+# Q4 <- bind_rows(Q4.F,Q4.G)
+Q4 <- bind_rows(Q4.F,Q4.G) %>%
+  filter(!is.na(ohq835) & !is.na(ohq850) & !is.na(ohq855) & !is.na(ohq860))
+
+SMK.F <- sasxport.get("SMQ_F.XPT")
+SMK.G <- sasxport.get("SMQ_G.XPT")
+# SMK.H <- sasxport.get("SMQ_H.XPT")
+bind_rows(
+  SMK.F %>% select(seqn, smq020, smq040) %>% mutate(source = "F"),
+  SMK.G %>% select(seqn, smq020, smq040) %>% mutate(source = "G")
+) %>% mutate(smk_stt = !(is.na(smq020) | is.na(smq040))) %>%
+  select(seqn, smk_stt, source) -> SMK
+
+Q5 <- inner_join(Q4, SMK, by = "seqn")
+data <- merge(temp1, Q5, by.x = "seqn", by.y = "seqn", all = FALSE) 
+
+teeth <- data %>% select( starts_with("ohx") | starts_with("seqn")) %>%
+  pivot_longer(cols = starts_with("ohx"),
+               names_to = "tooth_id",
+               values_to = "value") %>%
+  mutate(tooth = str_extract(tooth_id, "\\d\\d"),
+         test = str_extract(tooth_id, "pc|la"),
+         site = str_extract(tooth_id, "[d|s|p|a]$"))
+num_missing_tooth <- teeth %>% 
+  group_by(seqn, tooth, test) %>% 
+  summarise(NA_num = NA_num(value)) %>%
+  ungroup() %>%
+  filter(NA_num == 4) %>% 
+  group_by(seqn, test) %>%
+  summarise(num_missing_tooth = n()) %>%
+  ungroup() %>% 
+  filter(test == "la") %>% select(-test)#num_missing_tooth.la == num_missing_tooth.pc
+num_missing_sites <- teeth %>% 
+  group_by(seqn, test) %>% 
+  summarise(num_missing_sites = NA_num(value)) %>%
+  ungroup() %>%
+  filter(test == "la") %>% select(-test)
+
+data <- data %>% 
+  left_join(x = ., y = num_missing_tooth, by = "seqn") %>%
+  replace_na(list(num_missing_tooth = 0)) %>%
+  left_join(x = ., y = num_missing_sites, by = "seqn")
+d_orgin <- data %>% case_definition
+  
+dput(data, file = "HPC//100%_sample.d")
+
+if(RECYCLE) rm(list = c("teeth"))
+```
+
+# Descriptive statistics
+
+- CONSORT diagram
+
+```{r consort}
+study_cohorts <- 
+  DATA.processed %>%
+  cohort_start("Participants in the Oral Health Examination") %>%
+  # Define cohorts using named expressions --------------------
+  # Notice that you can use previously defined cohorts in subsequent steps
+  cohort_define(
+    with_tooth = .full %>% filter(seqn %in% DATA$seqn),
+    with_demo = with_tooth %>% filter(seqn %in% demo$SEQN),
+    with_demo_Q5 = with_demo %>% filter(seqn %in% data$seqn),
+    cohort_F = with_demo_Q5 %>% filter(seqn %in% SMK.F$seqn),
+    cohort_G = with_demo_Q5 %>% filter(seqn %in% SMK.G$seqn),
+    # anti_join is useful for counting exclusions -------------
+    excluded_with_tooth = anti_join(.full, with_tooth, by = "seqn"),
+    excluded_with_demo = anti_join(with_tooth, with_demo, by = "seqn"),
+    excluded_with_demo_Q5 = anti_join(with_demo, with_demo_Q5, by = "seqn")
+  ) %>%
+  # Provide text labels for cohorts ---------------------------
+  cohort_label(
+    with_tooth = "Having at least one tooth",
+    with_demo = "Demographic data available",
+    with_demo_Q5 = "Demographic and behavioral data available",
+    cohort_F = "Cohort F, the training set",
+    cohort_G = "Cohort G, the test set",
+    excluded_with_tooth = "All teeth lost",
+    excluded_with_demo = "Demographic data unavailable",
+    excluded_with_demo_Q5 = "Behavioral data unavailable"
+  )
+
+study_consort <- study_cohorts %>%
+  consort_box_add(
+    "full", 0, 50, cohort_count_adorn(study_cohorts, .full)) %>%
+  consort_box_add(
+    "excluded_with_tooth", 1, 45, cohort_count_adorn(study_cohorts, excluded_with_tooth)) %>%
+  consort_box_add(
+    "with_tooth", 0, 40, cohort_count_adorn(study_cohorts, with_tooth)) %>%
+  consort_box_add(
+    "excluded_with_demo", 1, 35, cohort_count_adorn(study_cohorts, excluded_with_demo)) %>%
+  consort_box_add(
+    "with_demo", 0, 30, cohort_count_adorn(study_cohorts, with_demo)) %>%
+  consort_box_add(
+    "excluded_with_demo_Q5", 1, 25, cohort_count_adorn(study_cohorts, excluded_with_demo_Q5)) %>%
+  consort_box_add(
+    "with_demo_Q5", 0, 20, cohort_count_adorn(study_cohorts, with_demo_Q5)) %>%
+  # consort_box_add(
+  #   "cohort_F", -30, 35, cohort_count_adorn(study_cohorts, cohort_F)) %>%
+  # consort_box_add(
+  #   "cohort_G", 30, 35, cohort_count_adorn(study_cohorts, cohort_G)) %>%
+  consort_arrow_add(end = "excluded_with_tooth", end_side = "left", start_x = 0, start_y = 45) %>%
+  consort_arrow_add("full", "bottom", "with_tooth", "top") %>%
+  consort_arrow_add(end = "excluded_with_demo", end_side = "left", start_x = 0, start_y = 35) %>%
+  consort_arrow_add("with_tooth", "bottom", "with_demo", "top") %>%
+  consort_arrow_add("with_demo", "bottom", "with_demo_Q5", "top") %>%
+  consort_arrow_add(end = "excluded_with_demo_Q5", end_side = "left", start_x = 0, start_y = 25) %>%
+  # consort_arrow_add(end = "excluded_with_demo_Q5", end_side = "left", start_x = 0, start_y = 45) %>%
+  consort_arrow_add("full", "bottom", "with_demo_Q5", "top") #%>%
+  # consort_arrow_add("with_demo_Q5", "bottom", "cohort_F", "top") %>%
+  # consort_arrow_add("with_demo_Q5", "bottom", "cohort_G", "top")
+
+fig.temp <- study_consort %>%
+  ggplot() + 
+  geom_consort() + xlim(-1, 2) + ylim(20, 50) + 
+  theme_consort(margin_h = 4, margin_v = 2) #+
+
+fig.temp
+ggsave("figures//CONSORT.jpeg", fig.temp, 
+       width = FIG.WIDTH, height = 0.5*FIG.WIDTH, dpi = 1000)
+ggsave("figures//CONSORT.pdf", fig.temp, 
+       width = FIG.WIDTH, height = 0.5*FIG.WIDTH)
+if(RECYCLE) rm(list = c("Q4", "Q5", "temp1", "DATA", "demo", "fig.temp", "Q4.F", "Q4.G",
+                        "SMK", "SMK.F", "SMK.G", "study_cohorts", "try.F","try.G", "study_consort"))
+```
+
+- number of subjects with different number of missing tooth
+
+```{r demographic tableone}
+tbl.temp <- d_orgin %>%
+  mutate(num.miss.tooth.level = cut(num_missing_tooth, 
+                                    breaks = c(-Inf, 0.1, 5.1, 10.1, 15.1, Inf),
+                                    labels = c("No missing","Missing <= 5",
+                                               "5 < Missing <= 10", 
+                                               "10 < Missing <= 15",
+                                               "Missing > 15"))) %>%
+  mutate(ps = if_else(ps == "no", "No/Mild",
+                      if_else(ps == "mod", "Moderate", 
+                              if_else(ps == "mild", "No/Mild", "Severe")))) %>%
+  mutate(ps = factor(ps, levels = c("No/Mild", "Moderate", "Severe"))) %>%
+  mutate(race = str_to_title(race)) %>%
+  rename(Age = age, Sex = sex, Race = race, `Smoking Status` = smk_stt,
+         `Periodontitis` = ps, `Number of Missing Teeth` = num.miss.tooth.level) %>%
+  tableone::CreateTableOne(data = ., 
+                           vars = c("Age","Sex","Race", "Smoking Status", 
+                                    "Number of Missing Teeth"),
+                           test = FALSE, strata = "Periodontitis",
+                           addOverall = T) %>%
+  tableone::kableone(., nonnormal = "Age", minMax = TRUE) %>%
+  kable_classic(full_width = F, html_font = "Cambria") 
+tbl.temp
+save_kable(tbl.temp, file = "figures//number_missing_teeth.jpeg", 
+           density = 1000, zoom = 2.5)
+```
+
+```{r subjects by missing tooth}
+#Number of subjects and the number of missing teeth
+d_orgin %>% 
+  mutate(num.miss.tooth.level = cut(num_missing_tooth, 
+                                    breaks = c(-Inf, 0.1, 5.1, 10.1, 15.1, Inf),
+                                    labels = c("No missing","Missing <= 5",
+                                               "5 < Missing <= 10", 
+                                               "10 < Missing <= 15",
+                                               "Missing > 15"))) %>%
+  count(num.miss.tooth.level) %>% 
+  mutate(Count = paste(n, " (", round(n/sum(n)*100, digits = 1), "%)", sep = "")) %>%
+  rename(`Number of Missing Teeth` = num.miss.tooth.level) %>%
+  select(`Number of Missing Teeth`, `Count`) %>%
+  kbl() %>%
+  kable_classic(full_width = F, html_font = "Cambria") -> tbl.temp
+tbl.temp
+save_kable(tbl.temp, file = "figures//number_missing_teeth.jpeg", 
+           density = 1000, zoom = 2.5)
+```
+
+# Coefficients for Imputation Models
+
+```{r imputation coefs}
+temp <- d_orgin %>% 
+  filter(num_missing_tooth <= 5) %>%
+  mutate(mean_PC = 
+           (select(., ends_with(c("pcd", "pcs", "pcp", "pca"))) %>%
+              rowMeans(x = ., na.rm = TRUE)
+            ),
+         mean_CAL = 
+           (select(., ends_with(c("lad", "las", "lap", "laa"))) %>%
+              rowMeans(x = ., na.rm = TRUE)
+            )
+         )
+tempfun <- function(x) return(x$coefficients)
+lm(mean_PC ~ age+sex+race+
+             ohq835+ohq850+ohq855+ohq860+
+             smk_stt+
+             num_missing_tooth, 
+   data = temp) %>% summary() %>% tempfun() %>%
+  kbl(digits = 4) %>% kable_classic(full_width = F, html_font = "Cambria") -> tbl.temp
+tbl.temp
+save_kable(tbl.temp, file = "figures//covariates_coef_1.jpeg", 
+           density = 1000, zoom = 2.5)
+lm(mean_CAL ~ age+sex+race+
+             ohq835+ohq850+ohq855+ohq860+
+             smk_stt+
+             num_missing_tooth, 
+   data = temp) %>% summary() %>% tempfun() %>%
+  kbl(digits = 4) %>% kable_classic(full_width = F, html_font = "Cambria") -> tbl.temp
+tbl.temp
+save_kable(tbl.temp, file = "figures//covariates_coef_2.jpeg", 
+           density = 1000, zoom = 2.5)
+glm(MS ~ age+sex+race+
+             ohq835+ohq850+ohq855+ohq860+
+             smk_stt+
+             num_missing_tooth, 
+   data = temp, family = "binomial") %>% 
+  summary() %>% tempfun() %>%
+  kbl(digits = 4) %>% kable_classic(full_width = F, html_font = "Cambria") -> tbl.temp
+tbl.temp
+save_kable(tbl.temp, file = "figures//covariates_coef_3.jpeg", 
+           density = 1000, zoom = 2.5)
+glm(S ~ age+sex+race+
+             ohq835+ohq850+ohq855+ohq860+
+             smk_stt+
+             num_missing_tooth, 
+   data = temp, family = "binomial") %>% 
+  summary() %>% tempfun() %>%
+  kbl(digits = 4) %>% kable_classic(full_width = F, html_font = "Cambria") -> tbl.temp
+tbl.temp
+save_kable(tbl.temp, file = "figures//covariates_coef_4.jpeg", 
+           density = 1000, zoom = 2.5)
+```
+
+
+# Missing values imputed with MICE, on MSI, not run
+
+-   variables used as MACRO:
+    -   `N.CORE`, `N.IMP.CORE`, `NUM`: number of cores, imputation per core and imputed datasets
+    -   `MAXITER`: maximum number of iteration in MICE
+    -   `DATE`: today's date. Automatically generated.
+    -   `MICE_METH`: methods used in MICE, such as "pmm" and "cart". Looped according to the variable `mice_meth`.
+    -   `MICE_MODEL`: a character combination of "OHX" (dental health measurement), "demo" (demographic data), "Q4" (the four questions in dental health questionnaire), "smk" (smoking status), "numtooth" (number of missing tooth). Looped according to the variable `mice_model`
+    -   `MODEL_FULL`: Automatically calculated using MICE_MODEL.
+
+```{r create scripts for MSI 1, eval=TRUE}
+### create R scripts
+mice_meth = c("pmm", "cart")
+mice_model = c("OHX", "OHX_demo", "OHX_demo_Q4", 
+               "OHX_demo_Q4_numtooth", "OHX_demo_Q4_smk", 
+               "OHX_demo_Q4_smk_numtooth")
+N.CORE = 5 %>% as.character()
+N.IMP.CORE = 2 %>% as.character()
+NUM = (as.numeric(N.CORE)*as.numeric(N.IMP.CORE)) %>% as.character()
+MAXITER = 50 %>% as.character()
+DATE = paste(substr(Sys.Date(), 6, 7), substr(Sys.Date(), 9, 10), sep = "") %>% as.character()
+
+model_full <- function(MICE_MODEL){
+  MODEL_FULL = ""
+  if(str_detect(MICE_MODEL, "OHX"))
+    MODEL_FULL = paste(MODEL_FULL, "starts_with('ohx')", sep = ", ")
+  if(str_detect(MICE_MODEL, "demo"))
+    MODEL_FULL = paste(MODEL_FULL, "age", "sex", "race", sep = ", ")
+  if(str_detect(MICE_MODEL, "Q4"))
+    MODEL_FULL = paste(MODEL_FULL, "starts_with('ohq')", sep = ", ")
+  if(str_detect(MICE_MODEL, "numtooth"))
+    MODEL_FULL = paste(MODEL_FULL, "num_missing_tooth", sep = ", ")
+  if(str_detect(MICE_MODEL, "smk"))
+    MODEL_FULL = paste(MODEL_FULL, "smk_stt", sep = ", ")
+  MODEL_FULL
+}
+```
+
+```{r create scripts for MSI 2, eval=FALSE, echo=TRUE}
+# mice_meth = "rf"
+# N.CORE = 10 %>% as.character()
+# N.IMP.CORE = 1 %>% as.character()
+#capitalized variable for MACRO use: NUM, MAXITER, DATE, MICE_METH, MICE_MODEL, MODEL_FULL
+Rscript <- "library(tidyverse)
+d <- dget(file='/home/guanwh/zhan7474/dental_micro/100%_sample.d')
+d_imp <- d %>% select(MODEL_FULL)
+ID <- d %>% select(all_of(setdiff(names(d), names(d_imp))))
+temp_d <- mice::parlmice(data = d_imp, maxit = MAXITER, 
+                     cluster.seed = 123456, n.core = N.CORE, n.imp.core = N.IMP.CORE,
+                     cl.type = 'FORK', meth = 'MICE_METH', printFlag = FALSE)
+for(i in 1:NUM){
+	d <- bind_cols(ID, complete(temp_d, i))
+	dput(d, paste('/home/guanwh/zhan7474/dental_micro/d_miced_MICE_METH_MICE_MODEL_', i, '.d', sep = ''))
+}
+save.image('/home/guanwh/zhan7474/dental_micro/micing_MICE_METH_MICE_MODEL_DATE.RData')"
+Rscript_file <- "HPC//micing_MICE_METH_MICE_MODEL_DATE.R"
+for(MICE_METH in mice_meth)
+    for(MICE_MODEL in mice_model){
+      Rscript_specified <- Rscript %>% 
+        str_replace_all(pattern = "NUM", NUM) %>%
+        str_replace_all(pattern = "MAXITER", MAXITER) %>%
+        str_replace_all(pattern = "DATE", DATE) %>%
+        str_replace_all(pattern = "MICE_METH", MICE_METH) %>%
+        str_replace_all(pattern = "MICE_MODEL", MICE_MODEL) %>%
+        str_replace_all(pattern = "MODEL_FULL", model_full(MICE_MODEL)) %>%
+        str_replace_all(pattern = "N.CORE", N.CORE) %>%
+        str_replace_all(pattern = "N.IMP.CORE", N.IMP.CORE)
+      Rscript_file_specified <- Rscript_file %>% 
+        str_replace_all(pattern = "MICE_METH", MICE_METH) %>%
+        str_replace_all(pattern = "DATE", DATE) %>%
+        str_replace_all(pattern = "MICE_MODEL", MICE_MODEL)
+      cat(Rscript_specified, file = Rscript_file_specified)
+    }
+
+### create shell files
+SH <- "#!/bin/bash
+#SBATCH --job-name=miceII
+#SBATCH -o /home/guanwh/zhan7474/dental_micro/micing_MICE_METH_MICE_MODEL_DATE.out
+#SBATCH -e /home/guanwh/zhan7474/dental_micro/micing_MICE_METH_MICE_MODEL_DATE.err
+#SBATCH -p msismall
+#SBATCH -c N.CORE
+#SBATCH --mem-per-cpu=1000
+#SBATCH -t 48:00:00
+
+module load R
+Rscript /home/guanwh/zhan7474/dental_micro/micing_MICE_METH_MICE_MODEL_DATE.R"
+SH_file <- "HPC//micing_MICE_METH_MICE_MODEL_DATE.sh"
+II = 1
+for(MICE_METH in mice_meth)
+    for(MICE_MODEL in mice_model){
+      SH_specified <- SH %>% 
+        str_replace_all(pattern = "II", as.character(II)) %>%
+        str_replace_all(pattern = "DATE", DATE) %>%
+        str_replace_all(pattern = "MICE_METH", MICE_METH) %>%
+        str_replace_all(pattern = "MICE_MODEL", MICE_MODEL) %>%
+        str_replace_all(pattern = "N.CORE", N.CORE)
+      SH_file_specified <- SH_file %>% 
+        str_replace_all(pattern = "MICE_METH", MICE_METH) %>%
+        str_replace_all(pattern = "DATE", DATE) %>%
+        str_replace_all(pattern = "MICE_MODEL", MICE_MODEL)
+      cat(SH_specified, file = SH_file_specified)
+      II = II+1
+    }
+rm(list= c("II"))
+
+### put files to the HPC MANUALLY
+#sesstion <- ssh::ssh_connect("zhan7474@agate.msi.umn.edu", verbose = TRUE)
+script <- "dos2unix /home/guanwh/zhan7474/dental_micro/micing_MICE_METH_MICE_MODEL_DATE.sh
+sbatch /home/guanwh/zhan7474/dental_micro/micing_MICE_METH_MICE_MODEL_DATE.sh\n"
+cat(" ", file = paste("HPC//script",DATE,".txt", sep = ""), append = FALSE)
+for(MICE_METH in mice_meth) {
+  for(MICE_MODEL in mice_model){
+    script_specified <- script %>% 
+      str_replace_all(pattern = "MICE_METH", MICE_METH) %>%
+      str_replace_all(pattern = "DATE", DATE) %>%
+      str_replace_all(pattern = "MICE_MODEL", MICE_MODEL)
+    cat(script_specified, file = paste("HPC//script",DATE,".txt", sep = ""), 
+        append = TRUE)
+  }
+}
+```
+
+# Importing imputed data and case defining:
+
+-   Importing imputed data
+-   Create the periodontal disease classification variable `sp`
+-   Separate variables into probing and attachment measures
+-   Input:
+    -   the dataset includes No. 02-31 teeth and each tooth has `la` and `pc` measurements.
+-   Outcomes:
+    -   `d$ps`: indicator for periodontal disease, values "mild", "mod", "sev"
+    -   `d$S`: indicator for *severe* periodontal disease, values TRUE/FALSE
+    -   `d$MS`: indicator for *moderate* to *severe* periodontal diseases, values TRUE/FALSE
+
+```{r case definition and import imputed data}
+NUM <- as.numeric(NUM)
+MICE_METH <- c("pmm", "cart")
+MICE_MODEL <- c("OHX", "OHX_demo_Q4", "OHX_demo_Q4_numtooth", 
+                "OHX_demo_Q4_smk", "OHX_demo_Q4_smk_numtooth")
+file_path <- "HPC//d_miced_MICE_METH_MICE_MODEL_NUM.d"
+file_paths <- file_path %>% 
+  sapply(X = ., FUN = str_replace, simplify = TRUE, 
+         pattern = "MICE_METH", replacement = MICE_METH) %>% c() %>%
+  sapply(X = ., FUN = str_replace, simplify = TRUE, 
+         pattern = "MICE_MODEL", replacement = MICE_MODEL) %>% c() %>%
+  sapply(X = ., FUN = str_replace, simplify = TRUE, 
+         pattern = "NUM", replacement = paste(1:NUM)) %>% c()
+
+data_miced_list <- sapply(X = file_paths, FUN = dget, simplify = FALSE)
+
+d_miced_list <- data_miced_list %>% lapply(., FUN = case_definition)
+d_list <- append(d_miced_list, list("d_orgin" = d_orgin), after=0)
+d_df <- d_list %>% 
+  bind_rows(.id = "df") %>%
+  mutate(source = str_extract(df, pattern = "(miced)|(orgin)")) %>%
+  mutate(method = str_extract(df, pattern = 
+                                paste(paste("(", MICE_METH, ")", 
+                                            sep = ""), 
+                                      collapse = "|"))
+         ) %>%
+  mutate(OHX = str_detect(df, "OHX"), DEMO = str_detect(df, "demo"),
+         OHQ = str_detect(df, "Q4"),  SMK  = str_detect(df, "smk"),
+         NUMTOOTH = str_detect(df, "numtooth"))
+
+flag <- lapply(d_miced_list, FUN = pull, "seqn") %>% 
+  lapply(., FUN = identical, d_orgin$seqn) %>% 
+  unlist()
+if(sum(!flag) > 0) {
+  stop("seqn in d_miced_list not match d_orgin")
+  knitr::knit_exit()
+}
+
+# train.d_miced_list <- d_miced_list %>% lapply(., FUN = dplyr::filter, source == "F")
+# test.d_miced_list  <- d_miced_list %>% lapply(., FUN = dplyr::filter, source == "G")
+
+# train.d_orgin <- data %>% filter(source == "F")
+# test.d_orgin <- data %>% filter(source == "G")
+if(RECYCLE) rm(list = c("d_miced_list", "data_miced_list"))
+```
+
+
+
+# Comparison between different MICE models and methods
+
+Models:
+
+  -   OHX only
+  -   OHX + covariates (OHQ, demo, smk_stt)
+  -   OHX + covariates (OHQ, demo, smk_stt) + num_missing_tooth
+  -   other models are also computed (not shown)
+
+Methods:
+
+  -   pmm
+  -   cart
+  
+```{r, fig.width=10, fig.height=6}
+tempfun <- function(var){
+  #rely on the variables in the .Global
+  #return a figure
+  #only include pmm, cart
+  d_df %>% 
+    group_by(df) %>% count(num_missing_tooth, !!as.name(var)) %>%
+    pivot_wider(names_from = !!as.name(var), values_from = n) %>%
+    mutate(df = str_remove_all(df, pattern = "(^HPC//d_)|(^d_)|(_\\d.d$)|(_\\d\\d.d$)")) %>%
+    filter(df %in% c("orgin", "miced_pmm_OHX", "miced_pmm_OHX_demo_Q4_smk", 
+                     "miced_pmm_OHX_demo_Q4_smk_numtooth",
+                     "miced_cart_OHX", "miced_cart_OHX_demo_Q4_smk", 
+                     "miced_cart_OHX_demo_Q4_smk_numtooth")) %>%
+    replace_na(list(`FALSE` = 0, `TRUE` = 0)) %>%
+    mutate(method = str_extract(df, "(pmm)|(cart)|(orgin)")) %>%
+    mutate(method = if_else(method == "orgin", 
+                            list(list("pmm", "cart")), 
+                            sapply(method, as.list, simplify = FALSE))) %>%
+    unnest_longer(col = method) %>%
+    mutate(model = str_remove_all(df, pattern = "(miced_cart_)|(miced_pmm_)")) %>%
+    mutate(prev = `TRUE`/(`FALSE` + `TRUE`)) %>%
+    mutate(sample_size = `FALSE` + `TRUE`) %>%
+    mutate(num_missing_tooth = as.factor(num_missing_tooth)) %>%
+    mutate(method = if_else(method == "pmm", "PMM",
+                    if_else(method == "cart", "CART",
+                    method))) %>%
+    ggplot(aes(x = num_missing_tooth, y = prev), data = .) + 
+    geom_point(aes(size = sample_size), inherit.aes = TRUE, color = COLORS[2],
+               data = . %>% filter(df == "orgin")) + 
+    scale_size(name = "Original Cases:\nNumber of participants", 
+               breaks = seq(250, 1500, by=250))+
+    #guides(size=guide_legend(title="Original Data:\nNumber of participants"))+
+    geom_boxplot(aes(fill = model), # ymax = max(prev), ymin = min(prev)
+                 inherit.aes = TRUE, color = "grey70",
+                 linewidth = 0.2, coef = 10, outlier.size = 0.5,
+                 data = . %>% filter(df != "orgin")) + 
+    scale_fill_manual(values = hsv(h=c(336-50, 336-25, 336)/360, s = 1, 
+                                   v = c(0.55, 0.7, 0.85)),
+                      name = "Susceptibility Cases:\nMICE models",
+                      labels = c("Only loss of attachment",
+                                 " + Covariates", 
+                                 " + Covariates + Number of lost teeth"))+
+    facet_grid(.~method) + theme_bw() + 
+    theme(panel.grid.major.x = element_blank(),
+          panel.grid.minor.y = element_blank())+
+    xlab("Number of lost teeth") + 
+    scale_y_continuous(name = ifelse(var == "S", "Prevelence of Severe cases", 
+                                     "Prevelence of Moderate and Severe cases"),
+                       limits = c(0,1),
+                       labels = scales::percent_format(accuracy = 1))
+}
+fig_temp1 <- tempfun("MS")
+fig_temp2 <- tempfun("S")
+fig.temp <- lemon::grid_arrange_shared_legend(fig_temp1, fig_temp2, ncol=1,
+                                              nrow=2, position = "bottom", plot = TRUE)
+ggsave("figures//Prevelence_missing_models.jpeg", fig.temp, 
+       width = FIG.WIDTH*1.5, height = 1*FIG.WIDTH, dpi = 1000)
+ggsave("figures//Prevelence_missing_models.pdf", fig.temp, 
+       width = FIG.WIDTH*1.5, height = 1*FIG.WIDTH)
+
+tempfun2 <- function(var){
+  #rely on the variables in the .Global
+  #return a figure
+  #only include pmm and cart!!!!!
+  d_df %>% 
+    mutate(age_grp = cut(age, seq(30, 80, by=5), include.lowest = TRUE)) %>%
+    group_by(df) %>% count(age_grp, !!as.name(var)) %>%
+    pivot_wider(names_from = !!as.name(var), values_from = n) %>%
+    mutate(df = str_remove_all(df, pattern = "(^HPC//d_)|(^d_)|(_\\d.d$)|(_\\d\\d.d$)")) %>%
+    filter(df %in% c("orgin", 
+                     "miced_cart_OHX_demo_Q4_smk_numtooth")) %>%
+    replace_na(list(`FALSE` = 0, `TRUE` = 0)) %>%
+    mutate(method = str_extract(df, "(pmm)|(cart)|(orgin)")) %>%
+    mutate(model = str_remove_all(df, pattern = "(miced_cart_)|(miced_pmm_)")) %>%
+    mutate(prev = `TRUE`/(`FALSE` + `TRUE`)) %>%
+    mutate(sample_size = `FALSE` + `TRUE`) %>%
+    ggplot(aes(x = age_grp, y = prev), data = .) + 
+    geom_point(aes(size = sample_size), inherit.aes = TRUE, color = COLORS[2],
+               data = . %>% filter(df == "orgin")) + 
+    scale_size(name = "Original Case:\nNumber of participants", 
+               breaks = seq(250, 1500, by=250))+
+    geom_boxplot(aes(fill = model), # ymax = max(prev), ymin = min(prev)
+                 inherit.aes = TRUE, color = "grey70",
+                 linewidth = 0.5, coef = 10, outlier.size = 0.5,
+                 data = . %>% filter(df != "orgin")) + 
+    scale_fill_manual(values = COLORS[1],
+                      name = "Susceptibility Cases",
+                      labels = c("CART"))+
+    # facet_grid(method~.) + 
+    theme_bw() + 
+    theme(panel.grid.major.x = element_blank(),
+          panel.grid.minor.y = element_blank())+
+    xlab("Age Groups") + 
+    ylab(ifelse(var == "S", "Prevelence of Severe cases", 
+                "Prevelence of Moderate and Severe cases"))+
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1))#+
+    # ylim(0,1)
+}
+fig_temp1 <- tempfun2("MS")
+fig_temp2 <- tempfun2("S")
+fig_temp1
+ggsave("figures//Prevelence_MS_age.jpeg", fig_temp1, 
+       width = FIG.WIDTH, height = 0.75*FIG.WIDTH, dpi = 1000)
+ggsave("figures//Prevelence_MS_age.pdf", fig_temp1, 
+       width = FIG.WIDTH, height = 0.75*FIG.WIDTH)
+fig_temp2
+ggsave("figures//Prevelence_Severe_age.jpeg", fig_temp2, 
+       width = FIG.WIDTH, height = 0.75*FIG.WIDTH, dpi = 1000)
+ggsave("figures//Prevelence_Severe_age.pdf", fig_temp2, 
+       width = FIG.WIDTH, height = 0.75*FIG.WIDTH)
+fig.temp <- lemon::grid_arrange_shared_legend(fig_temp1, fig_temp2, 
+                                              ncol=2, position = "right", plot = TRUE)
+ggsave("figures//Prevelence_age.jpeg", fig.temp, 
+       width = FIG.WIDTH*2, height = 0.75*FIG.WIDTH, dpi = 1000)
+ggsave("figures//Prevelence_age.pdf", fig.temp, 
+       width = FIG.WIDTH*2, height = 0.75*FIG.WIDTH)
+```
+
+
+# Comparing case definitions between MICEd dataset and oringinal dataset
+
+
+```{r}
+tempfun <- function(d){
+  #this function returns a summary table (kable) of ps, MS and S
+  summary(d[,c("ps","MS","S")]) %>%
+    kbl(caption = "Number of periodontal diseases in the MICEd dataset") %>%
+    kable_classic(full_width = F, html_font = "Cambria")
+}
+
+tempfun2 <- function(d_orgin, d_miced){
+  #compare frequecies between miced and original dataset
+  #only input a single data frame
+  #return a comparison table with original definition in columns
+  d_miced_ps <- d_miced %>% select(seqn, ps) 
+  d_orgin_ps <- d_orgin %>% select(seqn, ps) 
+  
+  comparison <- full_join(d_miced_ps, d_orgin_ps, by = "seqn")
+  comparison$ps.x <- factor(comparison$ps.x, 
+                            levels = c("no", "mild","mod","sev"))
+  comparison$ps.y <- factor(comparison$ps.y, 
+                            levels = c("no", "mild","mod","sev"))
+  comparison_tbl <- with(comparison,table(ps.y, ps.x))
+  comparison_tbl <- cbind(comparison_tbl, "Original" = rowSums(comparison_tbl))
+  comparison_tbl <- rbind(comparison_tbl, "Imputed" = colSums(comparison_tbl))
+  return(comparison_tbl)
+}
+
+models = str_replace("HPC//d_miced_cart_OHX_demo_Q4_numtooth_NUM.d",
+                     "NUM", as.character(1:10))
+temp <- array(data = NA, dim = c(5,5,length(models)), 
+              dimnames = list(c("no", "mild","mod","sev", "Imputed"),
+                              c("no", "mild","mod","sev", "Original"),
+                              NULL))
+for(i in 1:length(models)){
+  temp[ , ,i] <- tempfun2(d_orgin = d_orgin, 
+                          d_miced = d_list[[models[i]]])
+}
+comparison_mean <- round(apply(temp, MARGIN = c(1,2), FUN = mean))
+comparison_sd <- round(apply(temp, MARGIN = c(1,2), FUN = sd))
+comparison_tbl <- matrix(paste(c(comparison_mean), 
+                               if_else(c(comparison_sd) == 0, "",
+                                       paste(" \U00B1 ", c(comparison_sd), sep = "")),
+                               sep = ""),
+                    nrow = 5, ncol=5, byrow = FALSE)
+comparison_tbl[, 5] <- paste(comparison_tbl[, 5], " (",
+                             round(comparison_mean[,5]/comparison_mean[5,5]*100, 
+                                   digits = 1),
+                             "%)", sep ="")
+comparison_tbl[5, 1:4] <- paste(comparison_tbl[5, 1:4], "\n(",
+                             round(comparison_mean[5, 1:4]/comparison_mean[5,5]*100, 
+                                   digits = 1), " \U00B1 ",
+                             round(comparison_sd[5, 1:4]  /comparison_mean[5,5]*100, 
+                                   digits = 1), "%)", 
+                             sep ="")
+colnames(comparison_tbl) <- c("Healthy", "Mild", "Moderate", "Severe", "Total original cases")
+rownames(comparison_tbl) <- c("Healthy", "Mild", "Moderate", "Severe", "Total susceptibility cases")
+
+tbl.temp <- comparison_tbl%>% 
+  kbl("html", escape = F) %>%
+  kable_classic(full_width = F, html_font = "Cambria") 
+tbl.temp
+save_kable(tbl.temp, file = "figures//Case_Definition_comparison.jpeg", 
+           density = 1000, zoom = 2.5)
+
+```
+
+
+# Distribution of dental measurements of Ramfjord teeth pre- and post-imputation
+
+Using "cart" method and OHX+covariates+num.missing.tooth model. 
+
+```{r, fig.width=10, fig.height=6}
+Ramfjord <- names(d_orgin) %>% str_subset(pattern = "^ohx(03)|(09)|(12)|(19)|(25)|(28)")
+Full_mouth <- names(d_orgin) %>% str_subset(pattern = "^ohx")
+
+temp_fun <- function(d){
+  #count the number of specific LA/PC measurements at Ramfjord teeth
+  d <- d %>% select(all_of(Ramfjord)) %>% #the order of select = the order of Ramfjord
+    apply(MARGIN = 2, FUN = table, useNA = "no") %>% bind_rows() %>% 
+    as.matrix() %>% reshape2::melt(value.name = "Count", na.rm = FALSE) %>% 
+    as_tibble() %>% 
+    rename(Value = "Var2", Teeth = "Var1") %>%
+    mutate(Teeth = rep(Ramfjord, max(Value)+1)) %>%
+    mutate(tooth = str_extract(Teeth, "\\d\\d"),
+           test = str_extract(Teeth, "pc|la"),
+           site = str_extract(Teeth, "[d|s|p|a]$")) %>%
+    mutate(Count = replace_na(Count, 0))
+  return(d)
+}
+
+models = str_replace("HPC//d_miced_cart_OHX_demo_Q4_numtooth_NUM.d",
+                     "NUM", as.character(1:10))
+temp_orgin <- d_list[["d_orgin"]] %>% temp_fun()
+temp_miced <- d_list[models] %>% 
+  lapply(., FUN = temp_fun) %>%
+  lapply(., FUN = function(d) return(d$Count - temp_orgin$Count)) %>%
+  as.data.frame() %>% 
+  mutate(Recovered = apply(., MARGIN = 1, FUN = mean),
+         SD = apply(., MARGIN = 1, FUN = sd)) %>%
+  select(Recovered, SD) %>%
+  cbind(temp_orgin, .) %>%
+  as_tibble() %>%
+  rename(Observed = "Count") %>%
+  mutate(tooth = 
+    if_else(tooth == "03", "UR First Molar", # "03 UR First Molar",
+    if_else(tooth == "09", "UL Central Incisor", #"09 UL Central Incisor",
+    if_else(tooth == "12", "UL First Premolar",#"12 UL First Premolar",
+    if_else(tooth == "19", "LL First Molar",#"19 LL First Molar",
+    if_else(tooth == "25", "LR Central Incisor",#"25 LR Central Incisor",
+    if_else(tooth == "28", "LR First Premolar", #"28 LR First Premolar", 
+            tooth))))))) %>%
+  mutate(site =
+           if_else(site == "d", "DF",
+                   if_else(site == "s", "MF",
+                           if_else(site == "p", "DL",
+                                   if_else(site == "a", "ML", site)))))
+
+measurement = "la"
+temp <- temp_miced %>%
+  filter(test == measurement) %>% 
+  pivot_longer(cols = c("Observed", "Recovered"), 
+               names_to = "Type", values_to = "Count") %>%
+  mutate(SD = if_else(Type == "Observed", true = NA_real_, false = SD))
+temp2 <- temp %>% group_by(Teeth, Value) %>%
+  dplyr::summarise(tooth = unique(tooth), test = unique(test), site = unique(site),
+                   SD = sum(SD, na.rm = TRUE), Count = sum(Count)) %>%
+  ungroup()
+fig.temp <- temp %>%
+  ggplot(aes(x= Value, y = Count, 
+             fill = factor(Type, levels=c("Recovered", "Observed")))) + 
+  geom_bar(stat="identity", position = "stack") + facet_grid(site~tooth) +
+  geom_errorbar(mapping = aes(ymin = Count-SD, ymax = Count+SD, x = Value), width=0.8,
+                position=position_dodge(.9), data = temp2, inherit.aes = FALSE, 
+                color = "black", linewidth = 0.1)+
+  xlab(ifelse(measurement == "la", "Clinical Attachment Loss (mm)", "Pocket Depth (mm)")) +
+  scale_fill_manual(name = element_blank(), values = COLORS[c(1,2)],
+                    labels = c("Recovered via Imputation", "Observed")) +
+  theme_bw() + theme(legend.position="bottom")
+fig.temp
+ggsave(paste("figures//Recovered ", measurement, ".jpeg", sep = ""), 
+       fig.temp, width = FIG.WIDTH*1, height = 0.625*FIG.WIDTH, dpi = 1000)
+ggsave(paste("figures//Recovered ", measurement, ".pdf", sep = ""), 
+       fig.temp, width = FIG.WIDTH*1, height = 0.625*FIG.WIDTH)
+
+measurement = "pc"
+temp <- temp_miced %>%
+  filter(test == measurement) %>% 
+  pivot_longer(cols = c("Observed", "Recovered"), 
+               names_to = "Type", values_to = "Count") %>%
+  mutate(SD = if_else(Type == "Observed", true = NA_real_, false = SD))
+temp2 <- temp %>% group_by(Teeth, Value) %>%
+  dplyr::summarise(tooth = unique(tooth), test = unique(test), site = unique(site),
+                   SD = sum(SD, na.rm = TRUE), Count = sum(Count)) %>%
+  ungroup()
+fig.temp <- temp %>%
+  ggplot(aes(x= Value, y = Count, 
+             fill = factor(Type, levels=c("Recovered", "Observed")))) + 
+  geom_bar(stat="identity", position = "stack") + facet_grid(site~tooth) +
+  geom_errorbar(mapping = aes(ymin = Count-SD, ymax = Count+SD, x = Value), width=0.8,
+                position=position_dodge(.9), data = temp2, inherit.aes = FALSE, 
+                color = "black", linewidth = 0.1)+
+  xlab(ifelse(measurement == "la", "Clinical Attachment Loss (mm)", "Pocket Depth (mm)")) +
+  scale_fill_manual(name = element_blank(), values = COLORS[c(1,2)],
+                    labels = c("Recovered via Imputation", "Observed")) +
+  theme_bw() + theme(legend.position="bottom")
+fig.temp
+ggsave(paste("figures//Recovered ", measurement, ".jpeg", sep = ""), 
+       fig.temp, width = FIG.WIDTH*1, height = 0.625*FIG.WIDTH, dpi = 1000)
+ggsave(paste("figures//Recovered ", measurement, ".pdf", sep = ""), 
+       fig.temp, width = FIG.WIDTH*1, height = 0.625*FIG.WIDTH)
+
+if(RECYCLE) 
+  rm(list = c("temp_orgin", "temp_miced", "temp_fun"))
+```
+
+#  Spatial correlation of original and imputed dental measurements
+
+Based on a 1% random sample stratified on number of lost teeth.
+
+```{r, eval = TRUE, echo =TRUE, fig.width=10, fig.height=7}
+# set.seed(seed=12314)
+d_miced <- d_list[["HPC//d_miced_cart_OHX_demo_Q4_smk_numtooth_1.d"]]
+OHX_col <- str_detect(names(d_miced), pattern = "^ohx")
+d_miced_array <- array(NA, dim = c(dim(d_orgin)[1], sum(OHX_col), 10),
+                       dimnames = NULL)
+for(i in 1:10){
+  d_miced_array[,,i] <- 
+    as.matrix(d_list[[str_glue("HPC//d_miced_cart_OHX_demo_Q4_smk_numtooth_{i}.d")]][,OHX_col])
+}
+d_miced_ohx <- apply(d_miced_array, MARGIN = c(1,2), FUN = mean)
+d_miced[, OHX_col] <- d_miced_ohx
+d_miced_plot <- d_miced %>% 
+  group_by(num_missing_tooth) %>%
+  slice_sample(prop = 0.01) %>%
+  ungroup()
+dist_mds <- d_miced_plot %>% select(starts_with("ohx")) %>%
+  as.matrix() %>% dist() %>% cmdscale(., eig=TRUE, k=1)
+seqn_order <- as.character(d_miced_plot$seqn[order(dist_mds$points)])
+
+
+d_miced_plot_CAL <- d_miced_plot%>%
+  select(seqn, 
+         starts_with("ohx") & ends_with(str_c("la", c("d", "s", "p", "a")))) %>% 
+  pivot_longer(cols = starts_with("ohx"),
+               names_to = "site_id",
+               values_to = "value")
+d_orgin_plot_CAL <- d_orgin %>% 
+  filter(seqn %in% d_miced_plot$seqn) %>%
+  select(seqn, 
+         starts_with("ohx") & ends_with(str_c("la", c("d", "s", "p", "a")))) %>%
+  pivot_longer(cols = starts_with("ohx"),
+               names_to = "site_id",
+               values_to = "value")
+d_plot <- left_join(d_miced_plot_CAL, d_orgin_plot_CAL, by = c("seqn", "site_id")) %>% 
+  mutate(value.x = if_else(is.na(value.y), value.x, NA)) %>%
+  mutate(site_id = str_remove(site_id, pattern = "^ohx"))%>%
+  mutate(site_id = str_replace(site_id, pattern = "(pc)|(la)", "  ")) %>%
+  # rename("isimputed" = "value.y") %>%
+  mutate(seqn = as.factor(seqn)) %>%
+  mutate(seqn = fct_relevel(seqn, seqn_order))
+head(d_plot)
+CAL <- ggplot(d_plot, aes(x = site_id, y = seqn)) + 
+  geom_tile(data = subset(d_plot, !is.na(value.y)), aes(fill = value.y)) +
+  geom_tile(data = subset(d_plot, !is.na(value.x)), aes(fill = value.x),
+            color = "firebrick3", linewidth = 0.5) + 
+  scale_color_manual(values = "firebrick3", na.value = NA, guide = NULL) +
+  scale_fill_viridis_b(breaks = c(0,2,4,6,8,10,12), name = "CAL / mm") + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        axis.ticks.x=element_blank(), #remove x axis ticks
+        axis.text.y=element_blank(),  #remove y axis labels
+        axis.ticks.y=element_blank(), 
+        axis.title.y= element_blank())
+CAL
+
+d_miced_plot_PD <- d_miced_plot%>%
+  select(seqn, 
+         starts_with("ohx") & ends_with(str_c("pc", c("d", "s", "p", "a")))) %>% 
+  pivot_longer(cols = starts_with("ohx"),
+               names_to = "site_id",
+               values_to = "value")
+d_orgin_plot_PD <- d_orgin %>% 
+  filter(seqn %in% d_miced_plot$seqn) %>%
+  select(seqn, 
+         starts_with("ohx") & ends_with(str_c("pc", c("d", "s", "p", "a")))) %>%
+  pivot_longer(cols = starts_with("ohx"),
+               names_to = "site_id",
+               values_to = "value")
+d_plot <- left_join(d_miced_plot_PD, d_orgin_plot_PD, by = c("seqn", "site_id")) %>% 
+  mutate(value.x = if_else(is.na(value.y), value.x, NA)) %>%
+  mutate(site_id = str_remove(site_id, pattern = "^ohx"))%>%
+  mutate(site_id = str_replace(site_id, pattern = "(pc)|(la)", "  ")) %>%
+  # rename("isimputed" = "value.y") %>%
+  mutate(seqn = as.factor(seqn)) %>%
+  mutate(seqn = fct_relevel(seqn, seqn_order))
+head(d_plot)
+PD <- ggplot(d_plot, aes(x = site_id, y = seqn)) + 
+  geom_tile(data = subset(d_plot, !is.na(value.y)), aes(fill = value.y)) +
+  geom_tile(data = subset(d_plot, !is.na(value.x)), aes(fill = value.x),
+            color = "firebrick3", linewidth = 0.5) + 
+  scale_color_manual(values = "firebrick3", na.value = NA, guide = NULL) +
+  scale_fill_viridis_b(breaks = c(0,2,4,6,8,10), name = "PD / mm") + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        axis.ticks.x=element_blank(), #remove x axis ticks
+        axis.text.y=element_blank(),  #remove y axis labels
+        axis.ticks.y=element_blank(), 
+        axis.title.y= element_blank())
+PD
+
+ggsave("figures//CAL_imputed.jpeg", CAL, 
+       width = 12, height = 6, dpi = 300)
+ggsave("figures//CAL_imputed.pdf", CAL, 
+       width = 12, height = 6, dpi = 300)
+ggsave("figures//PD_imputed.jpeg", PD, 
+       width = 12, height = 6, dpi = 300)
+ggsave("figures//PD_imputed.pdf", PD, 
+       width = 12, height = 6, dpi = 300)
+```
+
+# Model Validation using ATT of smk_stt
+
+-   Using `smk_stt` as the covariate to establish the validity of missing data imputation.
+-   Using propensity score matching method.
+    -   propensity score model: $$logit(SMK) = \beta_0 + \beta_1 AGE + \beta_2 SEX + \beta_3 RACE_{BLACK} + \beta_4 RACE_{HISPANIC} + \beta_5 RACE_{OTHER}$$
+-   If the method is valid, we expect to have a higher average causal treatment effect among the treated (ATT) (a higher risk of prondental disease) among those who smoke, especially when $ATT = 0$ in the original dataset.
+
+```{r, fig.width=10, fig.height=6}
+#Propensity models using age, sex, race as the covariates
+#smk_stt is not balanced between sex and race
+tabUnmatched <- tableone::CreateTableOne(strata = "smk_stt", data = d_orgin, 
+                                         vars = c("age","sex","race"),test = FALSE)
+tableone::kableone(tabUnmatched, smd = TRUE) %>%
+  kable_classic(full_width = F, html_font = "Cambria") 
+
+tempfun2 <- function(d, var = "S"){
+  #calculate the ATT of smk_stt on prodentitist using propensity score matching
+  #within approach: do the PS matching in each imputed dataset
+  rownames(d) <- 1:nrow(d)
+  d <- d %>% mutate(sex = as.factor(sex), race = as.factor(race))
+  mod_match <- MatchIt::matchit(smk_stt ~ age + sex + race,
+                                data = d, ratio = 1, replace = TRUE)
+  match_index <- as.numeric(mod_match$match.matrix)
+  
+  d_var <- dplyr::pull(d, var)
+  x1 <- sum(d_var[d$smk_stt == TRUE])
+  x0 <- sum(d_var[match_index])
+
+  n1 <- sum(d$smk_stt == TRUE)
+  n0 <- length(match_index)
+  p1 <- x1/n1
+  p0 <- x0/n0
+  RR <- p1/p0
+  CI_RR <- exp(log(RR) + c(-1, 1)*qnorm(0.975)*sqrt(1/x1 + 1/x0 - 1/n1 - 1/n0))
+  ATT <- p1 -  p0
+  SE_ATT <- sqrt(p1*(1-p1)/n1 + p0*(1-p0)/n0)
+  CI_ATT <- p1 - p0 + c(-1, 1)*qnorm(0.975)*SE_ATT
+  return(list(ATT = ATT, CI = CI_ATT, p1=p1, p0=p0, N = n1, RR = RR, CI_RR = CI_RR, N0= n0))
+}
+
+tempfun3 <- function(seg, d, var = "S"){
+  #this function calculate ATT/the aesthetics required for one dataset
+  x = seg[1]
+  xend = seg[2]
+  d.seg <- d %>% dplyr::filter(num_missing_tooth >= x & num_missing_tooth < xend)
+  d.seg.ATT <- tempfun2(d.seg, var = var)
+  result <- data.frame(x=rep(x,2), xend=rep(xend,2), 
+                       y=c(d.seg.ATT$p0, d.seg.ATT$p1),
+                       yend=c(d.seg.ATT$p0, d.seg.ATT$p1),
+                       trt = c("Non-Smokers", "Smokers"),
+                       RR = c(NA_character_, 
+                              paste(round(d.seg.ATT$RR, digits = 2), " (",
+                                    paste(round(d.seg.ATT$CI_RR,digits = 2), collapse = ", "),
+                                    ")", sep = "")),
+                       Nt = c(d.seg.ATT$N0, d.seg.ATT$N)
+                       )
+  return(result)
+}
+
+tempfun4 <- function(d_list, var = "S", typical = 1, 
+                     segment = data.frame(x = c(0, 0.8, 14.8), 
+                                          xend = c(0.2, 14.2, 28.2))
+                     ){
+  #this function calculate ATT/the aesthetics required for all datasets
+  d_list_ATT <- lapply(d_list, 
+                       FUN = function(x) apply(segment, MARGIN = 1, 
+                                               FUN = tempfun3, d = x, var = var) ) %>%
+    lapply(., bind_rows) %>%
+    bind_rows(.id = "df")
+  d_list_ATT %>% 
+    mutate(source = str_extract(df, pattern = "(miced)|(orgin)"),
+           typical = str_detect(df, pattern = paste("(orgin)|", typical, sep=""))) %>%
+    mutate(typical = as.factor(typical)) #%>%
+}
+
+tempfun5 <- function(d, var = "S"){
+  #this function calculate prevalence/the aesthetics required for one dataset
+  d_prev <- d %>%
+    count(num_missing_tooth, !!as.name(var)) %>%
+    pivot_wider(names_from = !!as.name(var), values_from = n) %>%
+    replace_na(list(`FALSE` = 0, `TRUE` = 0)) %>%
+    mutate(prev = `TRUE`/(`FALSE` + `TRUE`)) %>%
+    mutate(sample_size = `FALSE` + `TRUE`)
+  return(d_prev)
+}
+tempfun6 <- function(d_list, var = "S", typical = 1){
+  #this function calculate prevalence/the aesthetics required for all datasets
+  d_list %>% lapply(., FUN = tempfun5, var = var) %>%
+    bind_rows(.id = "df") %>%
+    mutate(source = str_extract(df, pattern = "(miced)|(orgin)"),
+           typical = str_detect(df, pattern = paste("(orgin)|", typical, sep=""))) %>%
+    mutate(typical = as.factor(typical))
+}
+
+
+tempfun7 <- function(var, TYPICAL, d_list){
+  #just a wrapper function to plot the ATT figure
+  #return a figure
+  #for tempfun2-6, it's OK to process multiple miced datasets 
+  #because the results are not pooled, but in this function
+  #miced data are averaged!!
+  d_list_ATT <- d_list %>% 
+    tempfun4(d_list = ., var = var, typical = TYPICAL, 
+             segment = data.frame(x = c(0, 0.8, 14.8), 
+                                  xend = c(0.2, 14.2, 28.2))) %>%
+    mutate(source = if_else(source=="orgin", true = "Original", source)) %>%
+    mutate(source = if_else(source=="miced", true = "Imputed", source)) %>%
+    group_by(source, trt, x) %>%
+    summarise(x= unique(x), xend = unique(xend), 
+              Nt = mean(Nt, na.rm = TRUE),
+              y = mean(y), yend = mean(yend)) %>%
+    ungroup()
+  d_list_RR_CI <- d_list_ATT %>% 
+    pivot_wider(id_cols = c("source","x", "xend", "Nt"), 
+                names_from = trt, values_from = y) %>%
+    mutate(RR = `Smokers`/`Non-Smokers`,
+           x0 = `Non-Smokers`*Nt, x1 = `Smokers`*Nt,
+           n0 = Nt, n1 = Nt,
+           CI_low = exp(log(RR) + (-1)*qnorm(0.975)*sqrt(1/x1 + 1/x0 - 1/n1 - 1/n0)),
+           CI_high = exp(log(RR) + (+1)*qnorm(0.975)*sqrt(1/x1 + 1/x0 - 1/n1 - 1/n0))
+    )
+  d_list_RR_CI <- d_list_RR_CI %>% 
+    mutate(notes = paste(
+      "ATT = ", round(`Smokers`-`Non-Smokers`, digits = 3),"\n",
+      "RR = ", round(RR, digits = 2), 
+      # if_else(source == "Imputed","", 
+      if_else(rep(FALSE,6),"", 
+              paste(" (", round(CI_low, digits = 2), ", ", 
+                    round(CI_high, digits = 2), ")", sep = "")),
+      if_else(source == "Imputed", "", paste("\nN = ", Nt, sep = "")), 
+      sep = "")
+    ) %>%
+    mutate(subgroup = paste("[", ceil(x), ", ", floor(xend), "]", sep = "")) %>%
+    mutate(subgroup = factor(subgroup)) %>% 
+    mutate(subgroup = fct_recode(subgroup, `No missing` = "[0, 0]" )) %>%
+    mutate(source = factor(source)) %>%
+    mutate(source = fct_rev(source)) %>%
+    mutate(y = if_else(source == "Imputed", `Smokers` + 0.05, NA_real_)) %>%
+    mutate(y = if_else(source == "Original", 0        - 0.07, y       ))%>%
+    select(source, subgroup, y, Nt, RR, notes)
+
+  d_list_ATT %>% mutate(subgroup = paste("[", ceil(x), ", ", floor(xend), "]", sep = "")) %>%
+    mutate(subgroup = factor(subgroup)) %>% 
+    mutate(subgroup = fct_recode(subgroup, `No missing` = "[0, 0]" )) %>%
+    mutate(source = factor(source)) %>%
+    mutate(source = fct_rev(source)) %>%
+    mutate(source = fct_recode(source, Susceptibility="Imputed")) %>%
+    ggplot(aes(x = subgroup, fill = source, y = y, pattern = trt)) + 
+    geom_bar_pattern(stat="identity", position = "dodge", color = "black",
+                     pattern_fill = "grey40", pattern_colour = "grey40",
+                     pattern_angle = 45,
+                     pattern_density = 0.1,
+                     pattern_spacing = 0.025,
+                     pattern_key_scale_factor = 0.6)+ 
+    geom_label(aes(x=subgroup, y=y, label = notes, color = source), 
+               data = d_list_RR_CI, alpha = 0.5, inherit.aes = FALSE) + 
+    scale_color_manual(values = COLORS[c(1,2)],
+                       guide = "none") +
+    scale_pattern_manual(values = c(`Non-Smokers` = "stripe", `Smokers` = "none"),
+                         name = "Smoking status",
+                         labels = c("Non-Smokers\n(potential outcome)",
+                                    "Smokers"))+
+    scale_fill_manual(values = COLORS[c(1,2)],
+                       name = "Case Definition") +
+    scale_x_discrete(name = "Number of lost teeth")+
+    scale_y_continuous(name = ifelse(var == "S", "Prevelence of Severe cases", 
+                                     "Prevelence of Moderate and Severe cases"), 
+                       breaks = (if(var == "S") c(0, 0.25, 0.5, 0.75) else 
+                         c(0, 0.25, 0.5, 0.75, 1)), 
+                       limits = c(-0.12, ifelse(var == "S", 0.75, 1.1)),
+                       labels = scales::percent_format(accuracy = 1))+
+    theme_bw()+ 
+    theme(panel.grid.minor.x = element_blank(),
+          panel.grid.minor.y = element_blank())+
+    guides(pattern = guide_legend(override.aes = list(fill = "white")),
+           fill = guide_legend(override.aes = list(pattern = "none"))) -> fig.temp
+  return(fig.temp)
+}
+TYPICAL = 2
+models = c("d_orgin", 
+           str_replace("HPC//d_miced_cart_OHX_demo_Q4_numtooth_NUM.d",
+                       "NUM", as.character(1:10)))
+fig.temp1 <- tempfun7(var = "MS", TYPICAL = 2, d_list = d_list[models])
+fig.temp1
+ggsave("figures//ATT of smk (outcome moderate severe).jpeg", fig.temp1, 
+       width = FIG.WIDTH, height = 0.75*FIG.WIDTH, dpi = 1000)
+ggsave("figures//ATT of smk (outcome moderate severe).pdf", fig.temp1, 
+       width = FIG.WIDTH, height = 0.75*FIG.WIDTH, dpi = 1000)
+fig.temp2 <- tempfun7(var = "S", TYPICAL = 2, d_list = d_list[models])
+fig.temp2
+ggsave("figures//ATT of smk (outcome severe).jpeg", fig.temp2, 
+       width = FIG.WIDTH, height = 0.75*FIG.WIDTH, dpi = 1000)
+ggsave("figures//ATT of smk (outcome severe).pdf", fig.temp2, 
+       width = FIG.WIDTH, height = 0.75*FIG.WIDTH, dpi = 1000)
+fig.temp <- lemon::grid_arrange_shared_legend(fig.temp1, fig.temp2, 
+                                              ncol=2, position = "right", plot = TRUE)
+ggsave("figures//ATT of smk.jpeg", fig.temp, 
+       width = FIG.WIDTH*1.75, height = 0.75*FIG.WIDTH, dpi = 1000)
+ggsave("figures//ATT of smk.pdf", fig.temp, 
+       width = FIG.WIDTH*1.75, height = 0.75*FIG.WIDTH, dpi = 1000)
+```
+
+
+
+
+
+
+
+
+
+
+
